@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SelSup HTML Wrappers
 // @namespace    selsup-html-wrappers
-// @version      3.9.7
+// @version      3.9.8
 // @description  Add SelSup HTML wrapper controls into WordPress Classic Editor and Gutenberg
 // @match        https://selsup.ru/wp-admin/*
 // @match        https://www.selsup.ru/wp-admin/*
@@ -25,7 +25,9 @@
   // CHANGE 3.9.4: layout больше не пересчитывается от обычных кликов и внутренних transitionend WordPress, только от реальных изменений ширины/zoom и восстановления toolbar.
   // CHANGE 3.9.4: выровнены select и кнопки в inline-toolbar по центру.
   // CHANGE 3.9.5: тот же адаптивный toolbar добавлен в Classic Editor. Он сворачивает разделы в More ↓, затем в SelSup ▾, чтобы не залезать в правую колонку публикации.
-  // CHANGE 3.9.7: Classic Editor теперь вставляет SelSup-блоки как Gutenberg-совместимые блоки, если запись уже содержит <!-- wp:... -->. Это убирает corrupted blocks при переходе из Classic в Gutenberg.
+  // CHANGE 3.9.7: Code/Text mode в Classic Editor вставляет SelSup-блоки как Gutenberg-совместимые блоки, если запись уже содержит <!-- wp:... -->.
+  // CHANGE 3.9.8: Visual mode в TinyMCE больше не получает Gutenberg comments напрямую. Это убирает пустые <p><!-- wp:... --></p>, лишнюю пустую строку и ошибку TinyMCE showBlockCaretContainer при вставке без выделения.
+  // CHANGE 3.9.8: Repair HTML теперь конвертирует Classic/TinyMCE HTML wrappers в валидные wp:group/wp:details блоки перед сохранением.
   const SELSUP_DEBUG = false;
   const LOG_PREFIX = "[SelSup HTML Wrappers]";
 
@@ -1951,7 +1953,13 @@
     debugLog("wrap tinymce", wrapper.label);
 
     editor.undoManager.transact(function () {
-      const gutenbergCompatible = classicContentUsesGutenbergBlocks(editor);
+      const contentHasGutenbergBlocks =
+        classicContentUsesGutenbergBlocks(editor);
+
+      // CHANGE 3.9.8: TinyMCE Visual mode cannot safely insert raw Gutenberg block comments.
+      // It wraps comments into <p><!-- wp:... --></p>, adds blank lines, and can crash on empty insertion.
+      // So Visual mode inserts normal HTML wrappers. Before save, Repair HTML converts them to valid blocks.
+      const gutenbergCompatible = false;
 
       if (wrapper.insertOnly) {
         const html = buildTinyMceHtml(wrapper, "", gutenbergCompatible);
@@ -1971,7 +1979,8 @@
 
       debugLog("wrap tinymce HTML mode", {
         wrapper: wrapper.label,
-        gutenbergCompatible: gutenbergCompatible,
+        contentHasGutenbergBlocks: contentHasGutenbergBlocks,
+        insertedGutenbergComments: false,
         selectedHtmlLength: selectedHtml.length,
       });
 
@@ -3871,15 +3880,142 @@
     return repaired;
   }
 
-  function repairClassicParagraphWrappedSelSupBlocksInHtml(html) {
-    const source = String(html || "");
+  function getWpBlockCustomClassNameFromElement(element, wpClassName) {
+    if (!element || !element.classList) return "";
 
-    return source.replace(
-      /<!--\s*wp:paragraph\s*-->\s*(?:<p>\s*)?((?:<div\b[^>]*class=["'][^"']*(?:ss-note|ss-step|temporary-hidden|code-block-wrapper)[^"']*["'][\s\S]*?<\/div>)|(?:<details\b[^>]*class=["'][^"']*ss-faq[^"']*["'][\s\S]*?<\/details>))\s*(?:<\/p>\s*)?<!--\s*\/wp:paragraph\s*-->/gi,
-      function (match, blockHtml) {
-        return buildWpHtmlBlock(blockHtml);
+    return Array.from(element.classList)
+      .filter(function (className) {
+        return className !== wpClassName;
+      })
+      .join(" ")
+      .trim();
+  }
+
+  function classicWrapperInnerHtmlToGutenbergInnerBlocks(html) {
+    const doc = document.implementation.createHTMLDocument("");
+    const container = doc.createElement("div");
+    const result = [];
+
+    container.innerHTML = String(html || "").trim();
+
+    Array.from(container.childNodes).forEach(function (node) {
+      if (node.nodeType === 8) return;
+
+      if (node.nodeType === 3) {
+        const text = node.nodeValue.replace(/\s+/g, " ").trim();
+
+        if (text) {
+          result.push(buildWpParagraphBlock(escapeHtml(text)));
+        }
+
+        return;
+      }
+
+      if (node.nodeType !== 1) return;
+      if (node.tagName.toLowerCase() === "br") return;
+
+      result.push(htmlElementToGutenbergInnerBlock(node));
+    });
+
+    return result.length ? result.join("\n") : buildWpParagraphBlock("");
+  }
+
+  function buildGutenbergBlockFromClassicWrapperHtml(blockHtml) {
+    const doc = document.implementation.createHTMLDocument("");
+    const container = doc.createElement("div");
+
+    container.innerHTML = String(blockHtml || "").trim();
+
+    const element = Array.from(container.childNodes).find(function (node) {
+      return node.nodeType === 1;
+    });
+
+    if (!element) return String(blockHtml || "").trim();
+
+    const tagName = element.tagName.toLowerCase();
+
+    if (tagName === "details") {
+      const className =
+        getWpBlockCustomClassNameFromElement(element, "wp-block-details") ||
+        "ss-faq";
+      const summary = element.querySelector(":scope > summary");
+      const summaryText = summary
+        ? summary.textContent.trim() || "Частый вопрос"
+        : "Частый вопрос";
+      const bodyContainer = doc.createElement("div");
+
+      Array.from(element.childNodes).forEach(function (node) {
+        if (node === summary) return;
+        if (node.nodeType === 3 && node.nodeValue.trim() === "") return;
+
+        bodyContainer.appendChild(node.cloneNode(true));
+      });
+
+      const detailsHtml =
+        '<details class="wp-block-details ' +
+        escapeHtml(className) +
+        '"><summary>' +
+        escapeHtml(summaryText) +
+        "</summary>\n" +
+        classicWrapperInnerHtmlToGutenbergInnerBlocks(bodyContainer.innerHTML) +
+        "\n</details>";
+
+      return buildWpBlockComment(
+        "details",
+        {
+          summary: summaryText,
+          className: className,
+        },
+        detailsHtml,
+      );
+    }
+
+    if (tagName === "div") {
+      const className = getWpBlockCustomClassNameFromElement(
+        element,
+        "wp-block-group",
+      );
+      const finalClassName = className || element.getAttribute("class") || "";
+      const groupHtml =
+        '<div class="wp-block-group' +
+        (finalClassName ? " " + escapeHtml(finalClassName) : "") +
+        '">\n' +
+        classicWrapperInnerHtmlToGutenbergInnerBlocks(element.innerHTML) +
+        "\n</div>";
+
+      return buildWpBlockComment(
+        "group",
+        finalClassName ? { className: finalClassName } : {},
+        groupHtml,
+      );
+    }
+
+    return buildWpHtmlBlock(element.outerHTML);
+  }
+
+  function repairClassicParagraphWrappedSelSupBlocksInHtml(html) {
+    let source = String(html || "");
+
+    // CHANGE 3.9.8: repair the broken TinyMCE result from older 3.9.7 attempts:
+    // <!-- wp:paragraph --><p><!-- wp:group ... --></p><div ...>...</div><p><!-- /wp:group --></p><!-- /wp:paragraph -->
+    // The outer paragraph and comment-paragraphs are invalid for Gutenberg and cause block validation errors.
+    source = source.replace(
+      /<!--\s*wp:paragraph\s*-->\s*<p>\s*<!--\s*wp:(group|details)\b[^>]*-->\s*<\/p>\s*((?:<div\b[^>]*class=["'][^"']*(?:ss-note|ss-step|temporary-hidden|code-block-wrapper|wp-block-group)[^"']*["'][\s\S]*?<\/div>)|(?:<details\b[^>]*class=["'][^"']*(?:ss-faq|wp-block-details)[^"']*["'][\s\S]*?<\/details>))\s*<p>\s*<!--\s*\/wp:\1\s*-->\s*<\/p>\s*<!--\s*\/wp:paragraph\s*-->/gi,
+      function (match, blockName, blockHtml) {
+        return buildGutenbergBlockFromClassicWrapperHtml(blockHtml);
       },
     );
+
+    // CHANGE 3.9.8: repair old plain Classic wrappers that were saved as paragraph blocks:
+    // <!-- wp:paragraph --><div class="ss-note ...">...</div><!-- /wp:paragraph -->
+    source = source.replace(
+      /<!--\s*wp:paragraph\s*-->\s*(?:<p>\s*)?((?:<div\b[^>]*class=["'][^"']*(?:ss-note|ss-step|temporary-hidden|code-block-wrapper)[^"']*["'][\s\S]*?<\/div>)|(?:<details\b[^>]*class=["'][^"']*ss-faq[^"']*["'][\s\S]*?<\/details>))\s*(?:<\/p>\s*)?<!--\s*\/wp:paragraph\s*-->/gi,
+      function (match, blockHtml) {
+        return buildGutenbergBlockFromClassicWrapperHtml(blockHtml);
+      },
+    );
+
+    return source;
   }
 
   function repairClassicContentForGutenbergCompatibility() {
