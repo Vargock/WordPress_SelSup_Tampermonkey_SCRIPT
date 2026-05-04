@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         SelSup HTML Wrappers
 // @namespace    selsup-html-wrappers
-// @version      3.9.8
+// @version      3.9.9
 // @description  Add SelSup HTML wrapper controls into WordPress Classic Editor and Gutenberg
-// @match        https://selsup.ru/wp-admin/*
-// @match        https://www.selsup.ru/wp-admin/*
-// @include      /^https:\/\/selsup\.ru\/wp-admin\/post\.php.*$/
-// @include      /^https:\/\/selsup\.ru\/wp-admin\/post-new\.php.*$/
+// @match        https://selsup.ru/wp-admin/post.php*
+// @match        https://selsup.ru/wp-admin/post-new.php*
+// @match        https://www.selsup.ru/wp-admin/post.php*
+// @match        https://www.selsup.ru/wp-admin/post-new.php*
 // @run-at       document-idle
 // @noframes
 // @grant        none
@@ -28,6 +28,7 @@
   // CHANGE 3.9.7: Code/Text mode в Classic Editor вставляет SelSup-блоки как Gutenberg-совместимые блоки, если запись уже содержит <!-- wp:... -->.
   // CHANGE 3.9.8: Visual mode в TinyMCE больше не получает Gutenberg comments напрямую. Это убирает пустые <p><!-- wp:... --></p>, лишнюю пустую строку и ошибку TinyMCE showBlockCaretContainer при вставке без выделения.
   // CHANGE 3.9.8: Repair HTML теперь конвертирует Classic/TinyMCE HTML wrappers в валидные wp:group/wp:details блоки перед сохранением.
+  // CHANGE 3.9.9: userscript запускается только на post.php/post-new.php, selection tracking debounced, automatic repair before save disabled.
   const SELSUP_DEBUG = false;
   const LOG_PREFIX = "[SelSup HTML Wrappers]";
 
@@ -763,6 +764,8 @@
   let lastGutenbergSelectedBlockIds = [];
   let selsupToolbarRefreshTimer = null;
   let selsupAdaptiveToolbarTimer = null;
+  let selsupRememberSelectionTimerImmediate = null;
+  let selsupRememberSelectionTimerDelayed = null;
   let selsupDevicePixelRatioMediaQuery = null;
   let selsupLastKnownDevicePixelRatio = window.devicePixelRatio || 1;
   let selsupLastAdaptiveLayoutSignature = "";
@@ -3091,8 +3094,18 @@
   function scheduleRememberGutenbergSelection() {
     if (!isGutenbergPage()) return;
 
-    window.setTimeout(rememberGutenbergSelection, 0);
-    window.setTimeout(rememberGutenbergSelection, 60);
+    window.clearTimeout(selsupRememberSelectionTimerImmediate);
+    window.clearTimeout(selsupRememberSelectionTimerDelayed);
+
+    selsupRememberSelectionTimerImmediate = window.setTimeout(
+      rememberGutenbergSelection,
+      0,
+    );
+
+    selsupRememberSelectionTimerDelayed = window.setTimeout(
+      rememberGutenbergSelection,
+      60,
+    );
   }
 
   function getStoredGutenbergSelectionInfo(select) {
@@ -5423,7 +5436,10 @@
     createInlineToolbar();
     createLoadedBadge();
     initToolbarObserver();
-    installClassicGutenbergCompatibilityRepair();
+
+    // CHANGE 3.9.9: automatic repair before save is disabled.
+    // Repair HTML remains available only through the manual toolbar button.
+    // installClassicGutenbergCompatibilityRepair();
 
     document.addEventListener(
       "selectionchange",
