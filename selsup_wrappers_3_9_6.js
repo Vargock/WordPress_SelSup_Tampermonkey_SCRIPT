@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SelSup HTML Wrappers
 // @namespace    selsup-html-wrappers
-// @version      3.9.5
+// @version      3.9.6
 // @description  Add SelSup HTML wrapper controls into WordPress Classic Editor and Gutenberg
 // @match        https://selsup.ru/wp-admin/*
 // @match        https://www.selsup.ru/wp-admin/*
@@ -4258,34 +4258,45 @@
     const leftEdge = Number.isFinite(toolbarLeft)
       ? toolbarLeft
       : toolbar.getBoundingClientRect().left;
-    const parentRect = toolbar.parentElement
-      ? toolbar.parentElement.getBoundingClientRect()
-      : { right: window.innerWidth };
 
-    let boundary = parentRect.right || window.innerWidth;
+    // CHANGE 3.9.6: Classic toolbar is inside #wp-content-media-buttons, whose width can collapse
+    // to the width of its children. If we use that parent as the boundary, then during measurement
+    // the toolbar is temporarily set to 0px and the calculated available width also becomes 0px.
+    // Use stable editor containers instead, plus the Visual/Text tabs as the right-side stopper.
+    const stableContainers = [
+      toolbar.closest("#wp-content-wrap"),
+      document.querySelector("#wp-content-wrap"),
+      toolbar.closest("#postdivrich"),
+      document.querySelector("#postdivrich"),
+      toolbar.closest("#post-body-content"),
+      document.querySelector("#post-body-content"),
+      toolbar.closest(".wp-editor-wrap"),
+      document.querySelector(".wp-editor-wrap"),
+    ].filter(Boolean);
 
-    // CHANGE 3.9.5: Classic Editor lives in the left content column, while the Publish/meta boxes
-    // sit in a separate right column. Limit SelSup toolbar to the left editor column so it cannot
-    // overlap or push into the Publish box.
-    [
-      "#post-body-content",
-      "#postdivrich",
-      "#wp-content-wrap",
-      "#wp-content-editor-tools",
-      "#wp-content-media-buttons",
-      ".wp-editor-wrap",
-    ].forEach(function (selector) {
-      document.querySelectorAll(selector).forEach(function (element) {
-        if (!element || !isElementRendered(element)) return;
-        if (!(element.contains(toolbar) || toolbar.contains(element))) return;
+    let boundary = window.innerWidth;
 
-        const rect = element.getBoundingClientRect();
+    stableContainers.forEach(function (element) {
+      if (!element || !isElementRendered(element)) return;
 
-        if (rect.right > leftEdge + 12) {
-          boundary = Math.min(boundary, rect.right);
-        }
-      });
+      const rect = element.getBoundingClientRect();
+
+      if (rect.right > leftEdge + 60) {
+        boundary = Math.min(boundary, rect.right);
+      }
     });
+
+    const tabs = document.querySelector(
+      "#wp-content-wrap .wp-editor-tabs, .wp-editor-tabs",
+    );
+
+    if (tabs && isElementRendered(tabs)) {
+      const rect = tabs.getBoundingClientRect();
+
+      if (rect.left > leftEdge + 60) {
+        boundary = Math.min(boundary, rect.left);
+      }
+    }
 
     [
       "#postbox-container-1",
@@ -4299,7 +4310,7 @@
 
         const rect = element.getBoundingClientRect();
 
-        if (rect.left > leftEdge + 12) {
+        if (rect.left > leftEdge + 60) {
           boundary = Math.min(boundary, rect.left);
         }
       });
@@ -4457,10 +4468,10 @@
     const availableWidth = getAdaptiveToolbarAvailableWidth(toolbar);
     const hiddenGroups = [];
 
-    // CHANGE 3.9.4: ограничиваем реальную ширину toolbar тем местом, которое есть в левом слоте header.
-    // Это не даёт SelSup-кнопкам выталкивать название/центр редактора.
-    toolbar.style.maxWidth = availableWidth + "px";
-    toolbar.style.width = availableWidth + "px";
+    // CHANGE 3.9.4: стартуем с ширины доступного слота.
+    // CHANGE 3.9.6: итоговая ширина ещё раз задаётся в finish(), чтобы collapsed-кнопка не стала 0px.
+    toolbar.style.maxWidth = Math.max(availableWidth, 1) + "px";
+    toolbar.style.width = Math.max(availableWidth, 1) + "px";
 
     // CHANGE 3.9.2: каждый пересчёт начинается с полного раскрытия inline-controls.
     // Это исправляет случай, когда toolbar свернулся при zoom/page scale, а после восстановления масштаба
@@ -4482,12 +4493,21 @@
 
     function finish(mode) {
       const neededWidth = getAdaptiveToolbarNeededWidth(toolbar);
+      const finalWidth =
+        mode === "collapsed"
+          ? Math.max(neededWidth, 72)
+          : Math.min(Math.max(neededWidth, 1), Math.max(availableWidth, 1));
       const signature = [
         mode,
         availableWidth,
         neededWidth,
         hiddenGroups.join("|"),
       ].join("::");
+
+      // CHANGE 3.9.6: collapsed mode must keep enough real width for the SelSup button.
+      // Classic can briefly report 0px while WP recalculates editor rows, but the button should remain visible.
+      toolbar.style.maxWidth = finalWidth + "px";
+      toolbar.style.width = finalWidth + "px";
 
       toolbar.dataset.selsupMode = mode;
       toolbar.dataset.selsupHiddenGroups = hiddenGroups.join(",");
@@ -4675,10 +4695,11 @@
         // Для Gutenberg оставляем шапку и правые элементы. body/documentElement не наблюдаем.
         const observedSelectors = isClassicToolbar
           ? [
+              // CHANGE 3.9.6: do not observe #wp-content-media-buttons or #wp-content-editor-tools.
+              // Those can resize because of the toolbar itself and cause repeated layout recalculation.
               "#post-body-content",
               "#postdivrich",
-              "#wp-content-editor-tools",
-              "#wp-content-media-buttons",
+              "#wp-content-wrap",
               "#postbox-container-1",
               "#side-sortables",
               "#submitdiv",
