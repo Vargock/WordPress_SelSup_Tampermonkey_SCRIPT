@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SelSup HTML Wrappers
 // @namespace    selsup-html-wrappers
-// @version      3.9.6
+// @version      3.9.7
 // @description  Add SelSup HTML wrapper controls into WordPress Classic Editor and Gutenberg
 // @match        https://selsup.ru/wp-admin/*
 // @match        https://www.selsup.ru/wp-admin/*
@@ -25,6 +25,7 @@
   // CHANGE 3.9.4: layout больше не пересчитывается от обычных кликов и внутренних transitionend WordPress, только от реальных изменений ширины/zoom и восстановления toolbar.
   // CHANGE 3.9.4: выровнены select и кнопки в inline-toolbar по центру.
   // CHANGE 3.9.5: тот же адаптивный toolbar добавлен в Classic Editor. Он сворачивает разделы в More ↓, затем в SelSup ▾, чтобы не залезать в правую колонку публикации.
+  // CHANGE 3.9.7: Classic Editor теперь вставляет SelSup-блоки как Gutenberg-совместимые блоки, если запись уже содержит <!-- wp:... -->. Это убирает corrupted blocks при переходе из Classic в Gutenberg.
   const SELSUP_DEBUG = false;
   const LOG_PREFIX = "[SelSup HTML Wrappers]";
 
@@ -1538,15 +1539,22 @@
     const selected = value.substring(start, end);
     const parts = getRawParts(wrapper);
 
-    const replacement = wrapper.insertOnly
-      ? parts.open
-      : parts.open + selected + parts.close;
-    const innerStart = wrapper.insertOnly
+    const gutenbergCompatible = /<!--\s*wp:/i.test(value);
+    const replacement = gutenbergCompatible
+      ? buildTinyMceHtml(wrapper, selected || "", true)
+      : wrapper.insertOnly
+        ? parts.open
+        : parts.open + selected + parts.close;
+    const innerStart = gutenbergCompatible
       ? start + replacement.length
-      : start + parts.open.length;
-    const innerEnd = wrapper.insertOnly
+      : wrapper.insertOnly
+        ? start + replacement.length
+        : start + parts.open.length;
+    const innerEnd = gutenbergCompatible
       ? start + replacement.length
-      : start + parts.open.length + selected.length;
+      : wrapper.insertOnly
+        ? start + replacement.length
+        : start + parts.open.length + selected.length;
 
     debugLog("wrap textarea", {
       wrapper: wrapper.label,
@@ -1699,7 +1707,185 @@
     return "<p></p>";
   }
 
-  function buildTinyMceHtml(wrapper, innerHtml) {
+  function getSafeWpCommentAttributes(attributes) {
+    const json = JSON.stringify(attributes || {});
+
+    return json.replace(/--/g, "\\u002d\\u002d");
+  }
+
+  function buildWpBlockComment(blockName, attributes, html) {
+    const attrs =
+      attributes && Object.keys(attributes).length
+        ? " " + getSafeWpCommentAttributes(attributes)
+        : "";
+
+    return (
+      "<!-- wp:" +
+      blockName +
+      attrs +
+      " -->\n" +
+      html +
+      "\n<!-- /wp:" +
+      blockName +
+      " -->"
+    );
+  }
+
+  function htmlToSingleParagraphHtml(html) {
+    const trimmed = String(html || "").trim();
+
+    if (!trimmed) return "<p></p>";
+    if (/^<p\b[\s\S]*<\/p>$/i.test(trimmed)) return trimmed;
+
+    return "<p>" + trimmed + "</p>";
+  }
+
+  function buildWpParagraphBlock(html) {
+    return buildWpBlockComment(
+      "paragraph",
+      {},
+      htmlToSingleParagraphHtml(html),
+    );
+  }
+
+  function buildWpHtmlBlock(html) {
+    return buildWpBlockComment("html", {}, String(html || "").trim());
+  }
+
+  function htmlElementToGutenbergInnerBlock(element) {
+    if (!element || element.nodeType !== 1) return "";
+
+    const tagName = element.tagName.toLowerCase();
+    const outerHtml = element.outerHTML;
+
+    if (tagName === "p") {
+      return buildWpParagraphBlock(outerHtml);
+    }
+
+    if (/^h[1-6]$/.test(tagName)) {
+      return buildWpBlockComment(
+        "heading",
+        { level: Number(tagName.slice(1)) },
+        outerHtml,
+      );
+    }
+
+    // CHANGE 3.9.7: для списков/таблиц/прочих сложных фрагментов не пытаемся вручную
+    // собирать внутреннюю структуру Gutenberg. Custom HTML внутри group валиден и не corrupt'ится.
+    return buildWpHtmlBlock(outerHtml);
+  }
+
+  function htmlFragmentToGutenbergInnerBlocks(html) {
+    const trimmed = String(html || "").trim();
+
+    if (!trimmed) return buildWpParagraphBlock("");
+    if (/<!--\s*wp:/i.test(trimmed)) return trimmed;
+
+    const doc = document.implementation.createHTMLDocument("");
+    const container = doc.createElement("div");
+    const result = [];
+
+    container.innerHTML = trimmed;
+
+    Array.from(container.childNodes).forEach(function (node) {
+      if (node.nodeType === 3) {
+        const text = node.nodeValue.replace(/\s+/g, " ").trim();
+
+        if (text) {
+          result.push(buildWpParagraphBlock(escapeHtml(text)));
+        }
+
+        return;
+      }
+
+      if (node.nodeType !== 1) return;
+      if (node.tagName.toLowerCase() === "br") return;
+
+      result.push(htmlElementToGutenbergInnerBlock(node));
+    });
+
+    return result.length ? result.join("\n") : buildWpParagraphBlock(trimmed);
+  }
+
+  function buildGutenbergCompatibleWrapperHtml(wrapper, innerHtml) {
+    if (wrapper.kind === "separator") {
+      return buildWpBlockComment(
+        "separator",
+        { className: wrapper.className || "" },
+        '<hr class="wp-block-separator has-alpha-channel-opacity ' +
+          escapeHtml(wrapper.className || "") +
+          '"/>',
+      );
+    }
+
+    if (wrapper.kind === "faq") {
+      const bodyHtml =
+        innerHtml || "<p>" + escapeHtml(wrapper.defaultBody || "") + "</p>";
+      const detailsHtml =
+        '<details class="wp-block-details ' +
+        escapeHtml(wrapper.className || "ss-faq") +
+        '"><summary>' +
+        escapeHtml(wrapper.summary || "Частый вопрос") +
+        "</summary>\n" +
+        htmlFragmentToGutenbergInnerBlocks(bodyHtml) +
+        "\n</details>";
+
+      return buildWpBlockComment(
+        "details",
+        {
+          summary: wrapper.summary || "Частый вопрос",
+          className: wrapper.className || "ss-faq",
+        },
+        detailsHtml,
+      );
+    }
+
+    const className = wrapper.className || "";
+    let innerBlocks = htmlFragmentToGutenbergInnerBlocks(innerHtml);
+
+    if (wrapper.kind === "note" || wrapper.kind === "step") {
+      innerBlocks =
+        buildWpParagraphBlock(getTitleHtml(wrapper)) + "\n" + innerBlocks;
+    }
+
+    const groupHtml =
+      '<div class="wp-block-group ' +
+      escapeHtml(className) +
+      '">\n' +
+      innerBlocks +
+      "\n</div>";
+
+    return buildWpBlockComment("group", { className: className }, groupHtml);
+  }
+
+  function classicContentUsesGutenbergBlocks(editor) {
+    const candidates = [];
+
+    try {
+      if (editor && editor.getContent) {
+        candidates.push(editor.getContent({ format: "raw" }));
+        candidates.push(editor.getContent({ format: "html" }));
+      }
+    } catch (error) {}
+
+    const contentTextarea = document.querySelector(
+      "textarea#content, #content",
+    );
+
+    if (contentTextarea && typeof contentTextarea.value === "string") {
+      candidates.push(contentTextarea.value);
+    }
+
+    return candidates.some(function (content) {
+      return /<!--\s*wp:/i.test(String(content || ""));
+    });
+  }
+
+  function buildTinyMceHtml(wrapper, innerHtml, gutenbergCompatible) {
+    if (gutenbergCompatible) {
+      return buildGutenbergCompatibleWrapperHtml(wrapper, innerHtml);
+    }
+
     if (wrapper.insertOnly) return wrapper.htmlContent || "";
 
     if (wrapper.kind === "note" || wrapper.kind === "step") {
@@ -1765,12 +1951,12 @@
     debugLog("wrap tinymce", wrapper.label);
 
     editor.undoManager.transact(function () {
+      const gutenbergCompatible = classicContentUsesGutenbergBlocks(editor);
+
       if (wrapper.insertOnly) {
-        editor.execCommand(
-          "mceInsertContent",
-          false,
-          wrapper.htmlContent || "",
-        );
+        const html = buildTinyMceHtml(wrapper, "", gutenbergCompatible);
+
+        editor.execCommand("mceInsertContent", false, html);
         return;
       }
 
@@ -1781,7 +1967,13 @@
         selectedText,
         markerId,
       );
-      const html = buildTinyMceHtml(wrapper, innerHtml);
+      const html = buildTinyMceHtml(wrapper, innerHtml, gutenbergCompatible);
+
+      debugLog("wrap tinymce HTML mode", {
+        wrapper: wrapper.label,
+        gutenbergCompatible: gutenbergCompatible,
+        selectedHtmlLength: selectedHtml.length,
+      });
 
       editor.execCommand("mceInsertContent", false, html);
     });
@@ -3679,6 +3871,101 @@
     return repaired;
   }
 
+  function repairClassicParagraphWrappedSelSupBlocksInHtml(html) {
+    const source = String(html || "");
+
+    return source.replace(
+      /<!--\s*wp:paragraph\s*-->\s*(?:<p>\s*)?((?:<div\b[^>]*class=["'][^"']*(?:ss-note|ss-step|temporary-hidden|code-block-wrapper)[^"']*["'][\s\S]*?<\/div>)|(?:<details\b[^>]*class=["'][^"']*ss-faq[^"']*["'][\s\S]*?<\/details>))\s*(?:<\/p>\s*)?<!--\s*\/wp:paragraph\s*-->/gi,
+      function (match, blockHtml) {
+        return buildWpHtmlBlock(blockHtml);
+      },
+    );
+  }
+
+  function repairClassicContentForGutenbergCompatibility() {
+    if (isGutenbergPage()) return false;
+
+    let changed = false;
+    const editor = getTinyMceEditor();
+
+    if (editor) {
+      try {
+        const html =
+          editor.getContent({ format: "raw" }) ||
+          editor.getContent({ format: "html" }) ||
+          "";
+        const repaired = repairClassicParagraphWrappedSelSupBlocksInHtml(html);
+
+        if (repaired !== html) {
+          editor.setContent(repaired);
+          editor.save();
+          changed = true;
+          debugLog("classic Gutenberg compatibility repair applied to TinyMCE");
+        }
+      } catch (error) {
+        debugWarn(
+          "classic Gutenberg compatibility repair failed in TinyMCE",
+          error,
+        );
+      }
+    }
+
+    const contentTextarea = document.querySelector(
+      "textarea#content, #content",
+    );
+
+    if (contentTextarea && typeof contentTextarea.value === "string") {
+      const repaired = repairClassicParagraphWrappedSelSupBlocksInHtml(
+        contentTextarea.value,
+      );
+
+      if (repaired !== contentTextarea.value) {
+        contentTextarea.value = repaired;
+        contentTextarea.dispatchEvent(new Event("input", { bubbles: true }));
+        contentTextarea.dispatchEvent(new Event("change", { bubbles: true }));
+        changed = true;
+        debugLog("classic Gutenberg compatibility repair applied to textarea");
+      }
+    }
+
+    return changed;
+  }
+
+  function installClassicGutenbergCompatibilityRepair() {
+    if (document.body.dataset.selsupClassicCompatibilityRepairInstalled === "1")
+      return;
+
+    document.body.dataset.selsupClassicCompatibilityRepairInstalled = "1";
+
+    document.addEventListener(
+      "submit",
+      function (event) {
+        if (
+          event.target &&
+          event.target.matches &&
+          event.target.matches("form#post")
+        ) {
+          repairClassicContentForGutenbergCompatibility();
+        }
+      },
+      true,
+    );
+
+    ["#publish", "#save-post", "#post-preview"].forEach(function (selector) {
+      const button = document.querySelector(selector);
+
+      if (!button) return;
+
+      button.addEventListener(
+        "mousedown",
+        function () {
+          repairClassicContentForGutenbergCompatibility();
+        },
+        true,
+      );
+    });
+  }
+
   function repairLegacyHtml() {
     observeAllEditorDocuments();
     addCssToAdminPage();
@@ -3687,7 +3974,10 @@
 
     if (isGutenbergPage()) {
       repairSelectedGutenbergHtmlBlocks();
+      return;
     }
+
+    repairClassicContentForGutenbergCompatibility();
   }
 
   function applyInlineStyle(wrapper) {
@@ -4997,6 +5287,7 @@
     createInlineToolbar();
     createLoadedBadge();
     initToolbarObserver();
+    installClassicGutenbergCompatibilityRepair();
 
     document.addEventListener(
       "selectionchange",
